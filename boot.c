@@ -1,4 +1,9 @@
 /*
+* Copyright (C) 2014 MediaTek Inc.
+* Modification based on code covered by the mentioned copyright
+* and/or permission notice(s).
+*/
+/*
  * Copyright (C) 1995, 1997 Wolfgang Solfrank
  * Copyright (c) 1995 Martin Husemann
  *
@@ -31,6 +36,7 @@
  */
 
 
+#define MTK_LOG_ENABLE 1
 #include <sys/cdefs.h>
 #ifndef lint
 __RCSID("$NetBSD: boot.c,v 1.9 2003/07/24 19:25:46 ws Exp $");
@@ -47,6 +53,11 @@ static const char rcsid[] =
 #include "ext.h"
 #include "fsutil.h"
 
+struct bs {
+    u_int8_t jmp[3];		/* bootstrap entry point */
+    u_int8_t oem[8];		/* OEM name and version */
+};
+
 int
 readboot(dosfs, boot)
 	int dosfs;
@@ -56,16 +67,36 @@ readboot(dosfs, boot)
 	u_char fsinfo[2 * DOSBOOTBLOCKSIZE];
 	u_char backup[DOSBOOTBLOCKSIZE];
 	int ret = FSOK;
-	
-	if (read(dosfs, block, sizeof block) < sizeof block) {
+	int n;
+	struct bs *bs;
+
+	LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "readboot() :");
+
+	if ((n = read(dosfs, block, sizeof block)) == -1 || n != sizeof block) {
+		LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - could not read boot block.");
 		perror("could not read boot block");
-                exit(2);
+		return FSFATAL;
 	}
 
 	if (block[510] != 0x55 || block[511] != 0xaa) {
-		pfatal("Invalid signature in boot block: %02x%02x", block[511], block[510]);
-                exit(2);
+		pfatal("Invalid signature in boot block: %02x%02x\n", block[511], block[510]);
+		LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "Invalid signature in boot block: %02x%02x\n", block[511], block[510]);
+		return FSFATAL;
 	}
+
+	/* If the OEM Name field is EXFAT, it's not FAT32, so bail */
+	if (!memcmp(&block[3], "EXFAT   ", 8)) {
+		LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "exFAT file system\n");
+		pfatal("exFAT filesystem is not supported.");
+		return FSOTHERFORMAT;
+	}
+	else if (!memcmp(&block[3], "NTFS    ", 8)) {
+		LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "NTFS file system\n");
+		pfatal("NTFS filesystem is not supported.");
+		return FSOTHERFORMAT;
+	}
+
+	bs = (struct bs *)block;
 
 	memset(boot, 0, sizeof *boot);
 	boot->ValidFat = -1;
@@ -89,28 +120,25 @@ readboot(dosfs, boot)
 	if (!boot->RootDirEnts)
 		boot->flags |= FAT32;
 	if (boot->flags & FAT32) {
+		LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "This is FAT32! Now check some FAT32-specific features.");
 		boot->FATsecs = block[36] + (block[37] << 8)
 				+ (block[38] << 16) + (block[39] << 24);
-		if (block[40] & 0x80)
+		if (block[40] & 0x80) {
 			boot->ValidFat = block[40] & 0x0f;
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "boot->ValidFat = %d", boot->ValidFat );
+		}
 
 		/* check version number: */
 		if (block[42] || block[43]) {
 			/* Correct?				XXX */
-			pfatal("Unknown file system version: %x.%x",
+			pfatal("Unknown filesystem version: %x.%x\n",
 			       block[43], block[42]);
-                        exit(2);
+			return FSFATAL;
 		}
 		boot->RootCl = block[44] + (block[45] << 8)
 			       + (block[46] << 16) + (block[47] << 24);
 		boot->FSInfo = block[48] + (block[49] << 8);
 		boot->Backup = block[50] + (block[51] << 8);
-
-		/* If the OEM Name field is EXFAT, it's not FAT32, so bail */
-		if (!memcmp(&block[3], "EXFAT   ", 8)) {
-			pfatal("exFAT filesystem is not supported.");
-			return FSFATAL;
-		}
 
 		/* check basic parameters */
 		if ((boot->FSInfo == 0) ||
@@ -125,10 +153,12 @@ readboot(dosfs, boot)
 			pfatal("Invalid FAT32 Extended BIOS Parameter Block");
 			return FSFATAL;
 		}
-		if (lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)
-		    != boot->FSInfo * boot->BytesPerSec
-		    || read(dosfs, fsinfo, sizeof fsinfo)
-		    != sizeof fsinfo) {
+
+		LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Read FS-Info block.");
+		if ((n = lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)) == -1
+		    || n != boot->FSInfo * boot->BytesPerSec
+		    || (n = read(dosfs, fsinfo, sizeof fsinfo)) == ((ssize_t)-1)
+		    || n != sizeof fsinfo) {
 			perror("could not read fsinfo block");
 			return FSFATAL;
 		}
@@ -143,6 +173,18 @@ readboot(dosfs, boot)
 		    || fsinfo[0x3fe] != 0x55
 		    || fsinfo[0x3ff] != 0xaa) {
 			pwarn("Invalid signature in fsinfo block\n");
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Invalid signature in fsinfo :" );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0] = %x", fsinfo[0] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x1e4] = %x", fsinfo[0x1e4] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x1fc] = %x", fsinfo[0x1fc] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x1fd] = %x", fsinfo[0x1fd] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x1fe] = %x", fsinfo[0x1fe] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x1ff] = %x", fsinfo[0x1ff] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x3fc] = %x", fsinfo[0x3fc] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x3fd] = %x", fsinfo[0x3fd] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x3fe] = %x", fsinfo[0x3fe] );
+			LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "  fsinfo[0x3ff] = %x", fsinfo[0x3ff] );
+
 			if (ask(1, "fix")) {
 				memcpy(fsinfo, "RRaA", 4);
 				memcpy(fsinfo + 0x1e4, "rrAa", 4);
@@ -152,10 +194,10 @@ readboot(dosfs, boot)
 				fsinfo[0x3fc] = fsinfo[0x3fd] = 0;
 				fsinfo[0x3fe] = 0x55;
 				fsinfo[0x3ff] = 0xaa;
-				if (lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)
-				    != boot->FSInfo * boot->BytesPerSec
-				    || write(dosfs, fsinfo, sizeof fsinfo)
-				    != sizeof fsinfo) {
+				if ((n = lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)) == -1
+				    || n != boot->FSInfo * boot->BytesPerSec
+				    || (n = write(dosfs, fsinfo, sizeof fsinfo)) == ((int)-1)
+				    || n != sizeof fsinfo) {
 					perror("Unable to write FSInfo");
 					return FSFATAL;
 				}
@@ -172,13 +214,16 @@ readboot(dosfs, boot)
 				       + (fsinfo[0x1ef] << 24);
 		}
 
-		if (lseek(dosfs, boot->Backup * boot->BytesPerSec, SEEK_SET)
-		    != boot->Backup * boot->BytesPerSec
-		    || read(dosfs, backup, sizeof backup) != sizeof  backup) {
+		if ((n = lseek(dosfs, boot->Backup * boot->BytesPerSec, SEEK_SET)) == -1
+		    || n != boot->Backup * boot->BytesPerSec
+		    || (n = read(dosfs, backup, sizeof backup)) == ((ssize_t)-1)
+		    || n != sizeof backup) {
 			perror("could not read backup bootblock");
 			return FSFATAL;
 		}
 		backup[65] = block[65];				/* XXX */
+
+		LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Compare backup..");
 		if (memcmp(block + 11, backup + 11, 79)) {
                         char tmp[255];
                         int i;
@@ -211,6 +256,8 @@ readboot(dosfs, boot)
 		}
 		/* Check backup FSInfo?					XXX */
 	}
+
+	LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - fill other info to struct bootblock") ;
 
 	if (boot->BytesPerSec % DOSBOOTBLOCKSIZE != 0) {
 		pfatal("Invalid sector size: %u", boot->BytesPerSec);
@@ -249,7 +296,7 @@ readboot(dosfs, boot)
 	else if (boot->NumClusters < (CLUST_RSRVD&CLUST16_MASK))
 		boot->ClustMask = CLUST16_MASK;
 	else {
-		pfatal("Filesystem too big (%u clusters) for non-FAT32 partition",
+		pfatal("Filesystem too big (%u clusters) for non-FAT32 partition\n",
 		       boot->NumClusters);
 		return FSFATAL;
 	}
@@ -276,6 +323,45 @@ readboot(dosfs, boot)
 	boot->NumFiles = 1;
 	boot->NumFree = 0;
 
+	if (bs) {
+		char oem[9];
+		memset(oem, 0, 9);
+		strncpy(oem, bs->oem, 8);
+		printf("\n OEM name and version : '%s' \n ", oem);
+	}
+
+	if (debugmessage) {
+		printf("\n\n-----------------------------------------------------------");
+		printf("\n   Boot Sector ");
+		printf("\n------------------------------------------------------------");
+		printf("\n BytesPerSec (bytes per sector) : %u ", boot->BytesPerSec);
+		printf("\n SecPerClust (sectors per cluster) : %u ", boot->SecPerClust);
+		printf("\n ResSectors (number of reserved sectors) : %u ", boot->ResSectors);
+		printf("\n FATs (number of FATs) : %u ", boot->FATs);
+		printf("\n RootDirEnts (number of root directory entries) : %u ", boot->RootDirEnts);
+		printf("\n Media (media descriptor) : 0x%x ", boot->Media);
+		printf("\n FATsmall (number of sectors per FAT16) : %u ", boot->FATsmall);
+		printf("\n SecPerTrack (sectors per track) : %u ", boot->SecPerTrack);
+		printf("\n Heads (number of heads) : %u ", boot->Heads);
+		printf("\n Sectors (total number of sectors) : %u ", boot->Sectors);
+		printf("\n HiddenSecs (# of hidden sectors) : %u ", boot->HiddenSecs);
+		printf("\n HugeSectors (# of sectors if bpbSectors == 0) : 0x%x ", boot->HugeSectors);
+		printf("\n FSInfo (FSInfo sector) : 0x%x ", boot->FSInfo);
+		printf("\n Backup (Backup of Bootblocks) : 0x%x ", boot->Backup);
+		printf("\n RootCl (Start of Root Directory) : 0x%x ", boot->RootCl);
+		printf("\n FSFree (Number of free clusters acc. FSInfo) : 0x%x ", boot->FSFree);
+		printf("\n FSNext (Next free cluster acc. FSInfo) : 0x%x ", boot->FSNext);
+		printf("\n------------------------------------------------------------");
+		printf("\n ClustMask (FAT12:fff, FAT16:ffff, FAT32:fffffff) : 0x%x ", boot->ClustMask);
+		printf("\n NumClusters (cluster numbers) : %u ", boot->NumClusters);
+		printf("\n NumSectors (how many sectors are there) : %u ", boot->NumSectors);
+		printf("\n FATsecs (how many sectors are in FAT) : %u ", boot->FATsecs);
+		printf("\n NumFatEntries (Max entry # in the FAT) : %u ", boot->NumFatEntries);
+		printf("\n ClusterOffset (at what sector would sector 0 start) : %u ", boot->ClusterOffset);
+		printf("\n ClusterSize (Cluster size in bytes) : %u ", boot->ClusterSize);
+		printf("\n------------------------------------------------------------\n");
+	}
+
 	return ret;
 }
 
@@ -285,10 +371,14 @@ writefsinfo(dosfs, boot)
 	struct bootblock *boot;
 {
 	u_char fsinfo[2 * DOSBOOTBLOCKSIZE];
+	int n;
 
-	if (lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)
-	    != boot->FSInfo * boot->BytesPerSec
-	    || read(dosfs, fsinfo, sizeof fsinfo) != sizeof fsinfo) {
+	LOG_PRI(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "writefsinfo()");
+
+	if ((n = lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)) == -1
+	    || n != boot->FSInfo * boot->BytesPerSec
+	    || (n = read(dosfs, fsinfo, sizeof fsinfo)) == ((ssize_t)-1)
+	    || n != sizeof fsinfo) {
 		perror("could not read fsinfo block");
 		return FSFATAL;
 	}
@@ -300,10 +390,10 @@ writefsinfo(dosfs, boot)
 	fsinfo[0x1ed] = (u_char)(boot->FSNext >> 8);
 	fsinfo[0x1ee] = (u_char)(boot->FSNext >> 16);
 	fsinfo[0x1ef] = (u_char)(boot->FSNext >> 24);
-	if (lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)
-	    != boot->FSInfo * boot->BytesPerSec
-	    || write(dosfs, fsinfo, sizeof fsinfo)
-	    != sizeof fsinfo) {
+	if ((n = lseek(dosfs, boot->FSInfo * boot->BytesPerSec, SEEK_SET)) == -1
+	    || n != boot->FSInfo * boot->BytesPerSec
+	    || (n = write(dosfs, fsinfo, sizeof fsinfo)) == ((int)-1)
+	    || n != sizeof fsinfo) {
 		perror("Unable to write FSInfo");
 		return FSFATAL;
 	}
