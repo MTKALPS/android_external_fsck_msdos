@@ -49,6 +49,7 @@ extern int alwaysyes;	/* assume "yes" for all questions */
 extern int preen;	/* we are preening */
 extern int rdonly;	/* device is opened read only (supersedes above) */
 extern int skipclean;	/* skip clean file systems if preening */
+extern int debugmessage;	/* print verbose message for debugging */
 
 extern struct dosDirEntry *rootDir;
 
@@ -80,6 +81,7 @@ int checkfilesys(const char *);
 #define	FSFATAL		16		/* Some unrecoverable error occured */
 #define FSDIRTY		32		/* File system is dirty */
 #define FSFIXFAT	64		/* Fix file system FAT */
+#define FSOTHERFORMAT 128   /* Indicate file system is not FAT */
 
 /*
  * read a boot block in a machine independend fashion and translate
@@ -147,4 +149,8 @@ char *rsrvdcltype(cl_t);
  */
 void clearchain(struct bootblock *, struct fatEntry *, cl_t);
 
+#include "mediatek_enhancement.h"
+
+#define MTK_VFAT_MAX_FILE_SIZE 0xffffffff
+extern u_int32_t fat_entry_max_len;
 #endif

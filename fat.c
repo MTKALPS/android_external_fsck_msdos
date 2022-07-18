@@ -50,7 +50,6 @@ static const char rcsid[] =
 static int checkclnum(struct bootblock *, int, cl_t, cl_t *);
 static int clustdiffer(cl_t, cl_t *, cl_t *, int);
 static int tryclear(struct bootblock *, struct fatEntry *, cl_t, cl_t *);
-static int _readfat(int, struct bootblock *, int, u_char **);
 
 /*-
  * The first 2 FAT entries contain pseudo-cluster numbers with the following
@@ -85,17 +84,17 @@ checkdirty(int fs, struct bootblock *boot)
 
 	buffer = malloc(boot->BytesPerSec);
 	if (buffer == NULL) {
-		perror("No space for FAT");
+		perror("checkdirty: No space for FAT");
 		return 1;
 	}
 
 	if (lseek(fs, off, SEEK_SET) != off) {
-		perror("Unable to read FAT");
+		perror("checkdirty: lseek error");
 		goto err;
 	}
 
-	if (read(fs, buffer, boot->BytesPerSec) != boot->BytesPerSec) {
-		perror("Unable to read FAT");
+	if (read(fs, buffer, boot->BytesPerSec) != (int)boot->BytesPerSec) {
+		perror("checkdirty: Unable to read FAT");
 		goto err;
 	}
 
@@ -103,16 +102,25 @@ checkdirty(int fs, struct bootblock *boot)
 	 * If we don't understand the FAT, then the file system must be
 	 * assumed to be unclean.
 	 */
-	if (buffer[0] != boot->Media || buffer[1] != 0xff)
+	if (buffer[0] != boot->Media || buffer[1] != 0xff) {
+		printf("checkdirty() : buffer[0](%x) != boot->Media(%x) || buffer[1](%x) != 0xff\n", buffer[0], boot->Media, buffer[1]) ;
 		goto err;
+	}
 	if (boot->ClustMask == CLUST16_MASK) {
-		if ((buffer[2] & 0xf8) != 0xf8 || (buffer[3] & 0x3f) != 0x3f)
+		if ((buffer[2] & 0xf8) != 0xf8 || (buffer[3] & 0x3f) != 0x3f) {
+			printf("checkdirty() : (buffer[2](%x) & 0xf8) != 0xf8 || (buffer[3](%x) & 0x3f) != 0x3f\n", buffer[2], buffer[3]) ;
 			goto err;
+		}
 	} else {
 		if (buffer[2] != 0xff || (buffer[3] & 0x0f) != 0x0f
 		    || (buffer[4] & 0xf8) != 0xf8 || buffer[5] != 0xff
-		    || buffer[6] != 0xff || (buffer[7] & 0x03) != 0x03)
+		    || buffer[6] != 0xff || (buffer[7] & 0x03) != 0x03) {
+		    printf("checkdirty() : buffer[2](%x) != 0xff || (buffer[3](%x) & 0x0f) != 0x0f"
+				"|| (buffer[4](%x) & 0xf8) != 0xf8 || buffer[5](%x) != 0xff"
+				"|| buffer[6](%x) != 0xff || (buffer[7](%x) & 0x03) != 0x03\n", 
+				buffer[2], buffer[3], buffer[4], buffer[5], buffer[6], buffer[7]) ;
 			goto err;
+		}
 	}
 
 	/*
@@ -121,9 +129,13 @@ checkdirty(int fs, struct bootblock *boot)
 	if (boot->ClustMask == CLUST16_MASK) {
 		if ((buffer[3] & 0xc0) == 0xc0)
 			ret = 1;
+		else
+			printf("buffer[3](%x) & 0xC0 != 0xC0\n", buffer[3]) ;
 	} else {
 		if ((buffer[7] & 0x0c) == 0x0c)
 			ret = 1;
+		else
+			printf("buffer[7](%x) & 0x0C != 0x0C\n", buffer[7]) ;
 	}
 
 err:
@@ -157,25 +169,54 @@ checkclnum(struct bootblock *boot, int fat, cl_t cl, cl_t *next)
 			*next = CLUST_EOF;
 			return FSFATMOD;
 		}
+		perror("[ERR] without any fix !\n") ;
 		return FSERROR;
 	}
 	return FSOK;
 }
 
 /*
+ * Get system free memory
+ */
+static int getfreemem(void)
+{
+	FILE *meminfo;
+	char aux[256];
+	unsigned long free, cached;
+ 
+	if(!(meminfo = fopen("/proc/meminfo", "r"))){
+		printf("\n open /proc/meminfo failed ! \n");
+		return 0;
+	}
+	free = cached = 0;
+	while( !feof(meminfo) && !fscanf(meminfo, "MemFree: %lu kB", &free) )
+            fgets(aux,sizeof(aux),meminfo);
+	while( !feof(meminfo) && !fscanf(meminfo, "Cached: %lu kB", &cached) )
+            fgets(aux,sizeof(aux),meminfo);
+	fclose(meminfo);
+
+	printf("System MemFree: %lu kB, Cached: %lu kB \n", free, cached);
+	return (free + cached); // size in KB
+}
+
+#define MTK_READFAT_SIZE	4096
+/*
+ * NOT Original Google's _readfat(), modified by MTK for memory conservaion purpose
  * Read a FAT from disk. Returns 1 if successful, 0 otherwise.
  */
 static int
-_readfat(int fs, struct bootblock *boot, int no, u_char **buffer)
+_readfat_mtk(int fs, struct bootblock *boot, int no, u_char **buffer)
 {
 	off_t off;
 
-        printf("Attempting to allocate %u KB for FAT\n",
-                (boot->FATsecs * boot->BytesPerSec) / 1024);
+	/* @MTK@ Only invoked by writefat(), in this case we need no more than 8 bytes  */
+	/*       But we still read out 4K for efficiency.				*/
+	
+        printf("Attempting to allocate 4KB for FAT\n");
 
-	*buffer = malloc(boot->FATsecs * boot->BytesPerSec);
+	*buffer = malloc(MTK_READFAT_SIZE);
 	if (*buffer == NULL) {
-		perror("No space for FAT");
+		perror("_readfat_mtk(): No space for FAT");
 		return 0;
 	}
 
@@ -183,13 +224,13 @@ _readfat(int fs, struct bootblock *boot, int no, u_char **buffer)
 	off *= boot->BytesPerSec;
 
 	if (lseek(fs, off, SEEK_SET) != off) {
-		perror("Unable to read FAT");
+		perror("_readfat_mtk(): Unable to read FAT");
 		goto err;
 	}
 
-	if (read(fs, *buffer, boot->FATsecs * boot->BytesPerSec)
-	    != boot->FATsecs * boot->BytesPerSec) {
-		perror("Unable to read FAT");
+	if (read(fs, *buffer, MTK_READFAT_SIZE)
+	    != MTK_READFAT_SIZE) {
+		perror("_readfat_mtk(): Unable to read FAT");
 		goto err;
 	}
 
@@ -200,6 +241,9 @@ _readfat(int fs, struct bootblock *boot, int no, u_char **buffer)
 	return 0;
 }
 
+// 6144 x 512 = 3MB, this need to be multiple of 3 because FAT12 use 1.5 byte per entry
+#define FAT_READ_MAX_SEC	6144
+#define MORE_SAVE_MEMORY    30000 //Size in KB
 /*
  * Read a FAT and decode it into internal format
  */
@@ -209,112 +253,216 @@ readfat(int fs, struct bootblock *boot, int no, struct fatEntry **fp)
 	struct fatEntry *fat;
 	u_char *buffer, *p;
 	cl_t cl;
+	off_t off;
 	int ret = FSOK;
+	int firstFAT=1, curFATsec=0, readFATsec;
+	cl_t cl_start, cl_end;
+	int FATSize, fatEntrySize;
+
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "readfat()") ;
 
 	boot->NumFree = boot->NumBad = 0;
-
-	if (!_readfat(fs, boot, no, &buffer))
-		return FSFATAL;
-		
-	fat = calloc(boot->NumClusters, sizeof(struct fatEntry));
-	if (fat == NULL) {
-		perror("No space for FAT");
-		free(buffer);
-		return FSFATAL;
+	// Check if allocate too many memory
+	if (boot->FATsecs > FAT_READ_MAX_SEC) {
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - boot->FATsecs(%d) > FAT_READ_MAX_SEC(%d)", boot->FATsecs, FAT_READ_MAX_SEC);
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - So readFATsec uses FAT_READ_MAX_SEC(%d)", FAT_READ_MAX_SEC);
+		readFATsec = FAT_READ_MAX_SEC;
+	} else {				
+		readFATsec = boot->FATsecs;
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - readFATsec = %d", readFATsec) ;
 	}
 
-	if (buffer[0] != boot->Media
-	    || buffer[1] != 0xff || buffer[2] != 0xff
-	    || (boot->ClustMask == CLUST16_MASK && buffer[3] != 0xff)
-	    || (boot->ClustMask == CLUST32_MASK
-		&& ((buffer[3]&0x0f) != 0x0f
-		    || buffer[4] != 0xff || buffer[5] != 0xff
-		    || buffer[6] != 0xff || (buffer[7]&0x0f) != 0x0f))) {
+	FATSize = (readFATsec * boot->BytesPerSec) >> 10;
+	fatEntrySize = (boot->NumClusters * sizeof(struct fatEntry)) >> 10;
+	printf("\nAttempting to allocate %d KB for FAT \n", FATSize);
+	printf("Allocate for fatEntry (%u x %zu) = %u KB \n", 
+	        boot->NumClusters, sizeof(struct fatEntry), fatEntrySize);
 
-		/* Windows 95 OSR2 (and possibly any later) changes
-		 * the FAT signature to 0xXXffff7f for FAT16 and to
-		 * 0xXXffff0fffffff07 for FAT32 upon boot, to know that the
-		 * file system is dirty if it doesn't reboot cleanly.
-		 * Check this special condition before errorring out.
-		 */
-		if (buffer[0] == boot->Media && buffer[1] == 0xff
-		    && buffer[2] == 0xff
-		    && ((boot->ClustMask == CLUST16_MASK && buffer[3] == 0x7f)
-			|| (boot->ClustMask == CLUST32_MASK
-			    && buffer[3] == 0x0f && buffer[4] == 0xff
-			    && buffer[5] == 0xff && buffer[6] == 0xff
-			    && buffer[7] == 0x07)))
-			ret |= FSDIRTY;
-		else {
-			/* just some odd byte sequence in FAT */
+	if ( (FATSize+fatEntrySize) > (getfreemem() - MORE_SAVE_MEMORY)) {
+		printf("\nSystem memory is not enough for reading FAT !!! \n");
+		printf("WARNING : fsck_msdos is skipped ! This has potential risk !!! \n");
+		exit(0);
+	}
+
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Try to allocate buffer/fat.") ;
+	buffer = calloc(readFATsec, boot->BytesPerSec);
+	fat = calloc(boot->NumClusters, sizeof(struct fatEntry));
+	if (fat == NULL || buffer == NULL) {
+		if (fat != NULL)
+			free(fat);
+		else
+			perror("Allocate fatEntry[] -- failed !\n") ;
+		
+		if (buffer != NULL)
+			free(buffer);
+		else
+			perror("Allocate a buffer for FAT table -- failed !\n") ;
+		
+		return FSFATAL;
+	}
+	
+	while(curFATsec < (int)boot->FATsecs) 
+	{
+		off = boot->ResSectors + no * boot->FATsecs + curFATsec;
+		off *= boot->BytesPerSec;
+		
+		if (debugmessage)
+			printf("\n readFATsec=%d, curFATsec=%d, off=%d ", readFATsec, curFATsec, (int)off);
+
+		if (lseek(fs, off, SEEK_SET) != off) {
+			perror("readfat: lseek error");
+			free(buffer);
+			free(fat);
+			return FSFATAL;
+		}
+
+		if (read(fs, buffer, readFATsec * boot->BytesPerSec)
+		    != (int)(readFATsec * boot->BytesPerSec)) {
+			perror("readfat: read FAT error");
+			free(buffer);
+			free(fat);
+			return FSFATAL;
+		}
+
+		// only check for first FAT entry for media type and dirty bits
+		if (firstFAT) {
+			xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "1st FAT, check media-type and dirty-bits") ;;
+			if (buffer[0] != boot->Media
+			    || buffer[1] != 0xff || buffer[2] != 0xff
+			    || (boot->ClustMask == CLUST16_MASK && buffer[3] != 0xff)
+			    || (boot->ClustMask == CLUST32_MASK
+				&& ((buffer[3]&0x0f) != 0x0f
+		    	|| buffer[4] != 0xff || buffer[5] != 0xff
+		    	|| buffer[6] != 0xff || (buffer[7]&0x0f) != 0x0f))) {
+
+				/* Windows 95 OSR2 (and possibly any later) changes
+				 * the FAT signature to 0xXXffff7f for FAT16 and to
+				 * 0xXXffff0fffffff07 for FAT32 upon boot, to know that the
+				 * file system is dirty if it doesn't reboot cleanly.
+				 * Check this special condition before errorring out.
+				 */
+				if (buffer[0] == boot->Media && buffer[1] == 0xff
+				    && buffer[2] == 0xff
+				    && ((boot->ClustMask == CLUST16_MASK && buffer[3] == 0x7f)
+					|| (boot->ClustMask == CLUST32_MASK
+				    && buffer[3] == 0x0f && buffer[4] == 0xff
+				    && buffer[5] == 0xff && buffer[6] == 0xff
+				    && buffer[7] == 0x07))) {
+						ret |= FSDIRTY;
+						printf("Dirty media-type info\n") ;
+				} else {
+					/* just some odd byte sequence in FAT */
 				
-			switch (boot->ClustMask) {
-			case CLUST32_MASK:
-				pwarn("%s (%02x%02x%02x%02x%02x%02x%02x%02x)\n",
-				      "FAT starts with odd byte sequence",
-				      buffer[0], buffer[1], buffer[2], buffer[3],
-				      buffer[4], buffer[5], buffer[6], buffer[7]);
-				break;
-			case CLUST16_MASK:
-				pwarn("%s (%02x%02x%02x%02x)\n",
-				    "FAT starts with odd byte sequence",
-				    buffer[0], buffer[1], buffer[2], buffer[3]);
-				break;
-			default:
-				pwarn("%s (%02x%02x%02x)\n",
-				    "FAT starts with odd byte sequence",
-				    buffer[0], buffer[1], buffer[2]);
-				break;
+					switch (boot->ClustMask) {
+					case CLUST32_MASK:
+						pwarn("%s (%02x%02x%02x%02x%02x%02x%02x%02x)\n",
+						      "FAT starts with odd byte sequence",
+						      buffer[0], buffer[1], buffer[2], buffer[3],
+						      buffer[4], buffer[5], buffer[6], buffer[7]);
+						break;
+					case CLUST16_MASK:
+						pwarn("%s (%02x%02x%02x%02x)\n",
+						    "FAT starts with odd byte sequence",
+						    buffer[0], buffer[1], buffer[2], buffer[3]);
+						break;
+					default:
+						pwarn("%s (%02x%02x%02x)\n",
+						    "FAT starts with odd byte sequence",
+						    buffer[0], buffer[1], buffer[2]);
+						break;
+					}
+	
+					if (ask(1, "Correct"))
+						ret |= FSFIXFAT;
+				}
 			}
 
-	
-			if (ask(1, "Correct"))
-				ret |= FSFIXFAT;
-		}
-	}
-	switch (boot->ClustMask) {
-	case CLUST32_MASK:
-		p = buffer + 8;
-		break;
-	case CLUST16_MASK:
-		p = buffer + 4;
-		break;
-	default:
-		p = buffer + 3;
-		break;
-	}
-	for (cl = CLUST_FIRST; cl < boot->NumClusters;) {
-		switch (boot->ClustMask) {
-		case CLUST32_MASK:
-			fat[cl].next = p[0] + (p[1] << 8)
-				       + (p[2] << 16) + (p[3] << 24);
-			fat[cl].next &= boot->ClustMask;
-			ret |= checkclnum(boot, no, cl, &fat[cl].next);
-			cl++;
-			p += 4;
-			break;
-		case CLUST16_MASK:
-			fat[cl].next = p[0] + (p[1] << 8);
-			ret |= checkclnum(boot, no, cl, &fat[cl].next);
-			cl++;
-			p += 2;
-			break;
-		default:
-			fat[cl].next = (p[0] + (p[1] << 8)) & 0x0fff;
-			ret |= checkclnum(boot, no, cl, &fat[cl].next);
-			cl++;
-			if (cl >= boot->NumClusters)
+			cl_start = CLUST_FIRST;
+			switch (boot->ClustMask) {
+			case CLUST32_MASK:
+				p = buffer + 8;
+				cl_end = readFATsec * 128;	// 512/4=128
 				break;
-			fat[cl].next = ((p[1] >> 4) + (p[2] << 4)) & 0x0fff;
-			ret |= checkclnum(boot, no, cl, &fat[cl].next);
-			cl++;
-			p += 3;
-			break;
+			case CLUST16_MASK:
+				p = buffer + 4;
+				cl_end = readFATsec * 256;	// 512/2=256
+				break;
+			default:
+				p = buffer + 3;
+				cl_end = readFATsec * 1024 / 3;	// readFATsec must be multiple of 3
+				break;
+			}
+			firstFAT = 0;
+		} else {
+			// not first time to read FAT, do not have to skip two entry
+			p = buffer;
+			
+			switch (boot->ClustMask) {
+			case CLUST32_MASK:
+				cl_start = curFATsec * 128;
+				cl_end = (curFATsec + readFATsec) * 128;
+				break;
+			case CLUST16_MASK:
+				cl_start = curFATsec * 256;
+				cl_end = (curFATsec + readFATsec) * 256;
+				break;
+			default:
+				cl_start = curFATsec * 1024 / 3;
+				cl_end = (curFATsec + readFATsec) * 1024 / 3;
+				break;
+			}
 		}
-	}
+		if (cl_end > boot->NumClusters)
+			cl_end = boot->NumClusters;
+		
+		if (debugmessage)
+			printf("\n cl_start=%u, cl_end=%u \n", cl_start, cl_end);
+
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Read next-value to fatEntry[] %x ~ %x", cl_start, cl_end) ;
+		for (cl = cl_start; cl < cl_end;) {
+			switch (boot->ClustMask) {
+			case CLUST32_MASK:
+				fat[cl].next = p[0] + (p[1] << 8)
+				       + (p[2] << 16) + (p[3] << 24);
+				fat[cl].next &= boot->ClustMask;
+				ret |= checkclnum(boot, no, cl, &fat[cl].next);
+				cl++;
+				p += 4;
+				break;
+			case CLUST16_MASK:
+				fat[cl].next = p[0] + (p[1] << 8);
+				ret |= checkclnum(boot, no, cl, &fat[cl].next);
+				cl++;
+				p += 2;
+				break;
+			default:
+				fat[cl].next = (p[0] + (p[1] << 8)) & 0x0fff;
+				ret |= checkclnum(boot, no, cl, &fat[cl].next);
+				cl++;
+				if (cl >= boot->NumClusters)
+					break;
+				fat[cl].next = ((p[1] >> 4) + (p[2] << 4)) & 0x0fff;
+				ret |= checkclnum(boot, no, cl, &fat[cl].next);
+				cl++;
+				p += 3;
+				break;
+			}
+		}	// end of for loop
+		
+		curFATsec += FAT_READ_MAX_SEC;
+		if ((curFATsec+readFATsec) > (int)boot->FATsecs) {
+			readFATsec = boot->FATsecs - curFATsec;
+		}
+		
+	}	// end of while(curFATsec < boot->FATsecs) 
 
 	free(buffer);
-	*fp = fat;
+	if (ret & FSFATAL) {
+		free(fat);
+		*fp = NULL;
+	} else
+		*fp = fat;
+	
 	return ret;
 }
 
@@ -325,12 +473,12 @@ char *
 rsrvdcltype(cl_t cl)
 {
 	if (cl == CLUST_FREE)
-		return "free";
+		return ("free");
 	if (cl < CLUST_BAD)
-		return "reserved";
+		return ("reserved");
 	if (cl > CLUST_BAD)
-		return "as EOF";
-	return "bad";
+		return ("as EOF");
+	return ("bad");
 }
 
 static int
@@ -347,6 +495,7 @@ clustdiffer(cl_t cl, cl_t *cp1, cl_t *cp2, int fatnum)
 					*cp2 = *cp1;
 					return FSFATMOD;
 				}
+				printf("[ERR] Without any fix !\n") ;
 				return FSFATAL;
 			}
 			pwarn("Cluster %u is marked %s in FAT 0, %s in FAT %d\n",
@@ -359,6 +508,7 @@ clustdiffer(cl_t cl, cl_t *cp1, cl_t *cp2, int fatnum)
 				*cp1 = *cp2;
 				return FSFATMOD;
 			}
+			printf("[ERR] Without any fix !\n") ;
 			return FSFATAL;
 		}
 		pwarn("Cluster %u is marked %s in FAT 0, but continues with cluster %u in FAT %d\n",
@@ -371,6 +521,7 @@ clustdiffer(cl_t cl, cl_t *cp1, cl_t *cp2, int fatnum)
 			*cp2 = *cp1;
 			return FSFATMOD;
 		}
+		printf("[ERR] Without any fix !\n") ;
 		return FSFATAL;
 	}
 	if (*cp2 == CLUST_FREE || *cp2 >= CLUST_RSRVD) {
@@ -384,6 +535,7 @@ clustdiffer(cl_t cl, cl_t *cp1, cl_t *cp2, int fatnum)
 			*cp1 = *cp2;
 			return FSFATMOD;
 		}
+		printf("[ERR] Without any fix !\n") ;
 		return FSERROR;
 	}
 	pwarn("Cluster %u continues with cluster %u in FAT 0, but with cluster %u in FAT %d\n",
@@ -396,6 +548,7 @@ clustdiffer(cl_t cl, cl_t *cp1, cl_t *cp2, int fatnum)
 		*cp1 = *cp2;
 		return FSFATMOD;
 	}
+	printf("[ERR] Without any fix !\n") ;
 	return FSERROR;
 }
 
@@ -411,8 +564,15 @@ comparefat(struct bootblock *boot, struct fatEntry *first,
 	int ret = FSOK;
 
 	for (cl = CLUST_FIRST; cl < boot->NumClusters; cl++)
-		if (first[cl].next != second[cl].next)
+		if (first[cl].next != second[cl].next) {
+			xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "first[cl(%x)].next(%x) != second[cl].next(%x)", cl, first[cl].next, second[cl].next);
 			ret |= clustdiffer(cl, &first[cl].next, &second[cl].next, fatnum);
+
+			ret|= checkFsckExecutionTime();
+			if (ret & FSFATAL) {
+				return ret;
+			}
+		}
 	return ret;
 }
 
@@ -421,7 +581,10 @@ clearchain(struct bootblock *boot, struct fatEntry *fat, cl_t head)
 {
 	cl_t p, q;
 
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "clearchain() is called! Clear from head(%x)..", head);
+
 	for (p = head; p >= CLUST_FIRST && p < boot->NumClusters; p = q) {
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - clear cluster#%x", p);
 		if (fat[p].head != head)
 			break;
 		q = fat[p].next;
@@ -439,8 +602,10 @@ tryclear(struct bootblock *boot, struct fatEntry *fat, cl_t head, cl_t *trunc)
 	} else if (ask(1, "Truncate")) {
 		*trunc = CLUST_EOF;
 		return FSFATMOD;
-	} else
+	} else {
+		printf("tryclear() : err! neither clearhchain() nor truncate!\n") ;
 		return FSERROR;
+	}
 }
 
 /*
@@ -449,14 +614,18 @@ tryclear(struct bootblock *boot, struct fatEntry *fat, cl_t head, cl_t *trunc)
 int
 checkfat(struct bootblock *boot, struct fatEntry *fat)
 {
-	cl_t head, p, h, n, wdk;
+	cl_t head, p, h, n;
 	u_int len;
 	int ret = 0;
 	int conf;
+	cl_t loop_cnt;
+
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "checkfat()") ;
 
 	/*
 	 * pass 1: figure out the cluster chains.
 	 */
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Figure out the cluster chains.") ;
 	for (head = CLUST_FIRST; head < boot->NumClusters; head++) {
 		/* find next untravelled chain */
 		if (fat[head].head != 0		/* cluster already belongs to some chain */
@@ -466,7 +635,7 @@ checkfat(struct bootblock *boot, struct fatEntry *fat)
 
 		/* follow the chain and mark all clusters on the way */
 		for (len = 0, p = head;
-			 p >= CLUST_FIRST && p < boot->NumClusters;
+		     p >= CLUST_FIRST && p < boot->NumClusters && fat[p].head != head;
 			 p = fat[p].next) {
 				/* we have to check the len, to avoid infinite loop */
 				if (len > boot->NumClusters) {
@@ -487,20 +656,31 @@ checkfat(struct bootblock *boot, struct fatEntry *fat)
 	 * we didn't know the real start of the chain then - would have treated partial
 	 * chains as interlinked with their main chain)
 	 */
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Check for crosslinked chains") ;
 	for (head = CLUST_FIRST; head < boot->NumClusters; head++) {
 		/* find next untravelled chain */
 		if (fat[head].head != head)
 			continue;
 
+		loop_cnt = 0;
 		/* follow the chain to its end (hopefully) */
-		/* also possible infinite loop, that's why I insert wdk counter */
-		for (p = head,wdk=boot->NumClusters;
-		     (n = fat[p].next) >= CLUST_FIRST && n < boot->NumClusters && wdk;
-				 p = n,wdk--) {
+		for (p = head;
+		     (n = fat[p].next) >= CLUST_FIRST && n < boot->NumClusters;
+		     p = n) {
+			// Check for incorrect backward link which may cause infinite loop
+			if ((n == head) || (n == p)) {
+				pwarn("Incorrect link : head = %u, fat[%u].next=%u \n",
+			      	head, p, n);
+				break;
+			}
+			loop_cnt++;
+			if (loop_cnt > boot->NumClusters) {
+				pwarn("ERROR : infinite loop : head = %u \n", head);
+				break;
+			}
 			if (fat[n].head != head)
 				break;
 		}
-
 		if (n >= CLUST_EOFS)
 			continue;
 
@@ -531,6 +711,7 @@ checkfat(struct bootblock *boot, struct fatEntry *fat)
 						/*
 						 * Have to reexamine this chain.
 						 */
+						printf("Re-examine this chain!\n") ; 
 						head--;
 						break;
 					}
@@ -554,10 +735,17 @@ writefat(int fs, struct bootblock *boot, struct fatEntry *fat, int correct_fat)
 {
 	u_char *buffer, *p;
 	cl_t cl;
-	int i;
-	u_int32_t fatsz;
+	u_int i;
+	size_t fatsz;
 	off_t off;
 	int ret = FSOK;
+
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "writefat()") ;
+	
+	if(!correct_fat)
+	{
+		pwarn("corrct_fat = 0 \n");
+	}
 
 	buffer = malloc(fatsz = boot->FATsecs * boot->BytesPerSec);
 	if (buffer == NULL) {
@@ -600,9 +788,17 @@ writefat(int fs, struct bootblock *boot, struct fatEntry *fat, int correct_fat)
 			break;
 		}
 
-		if (!_readfat(fs, boot, boot->ValidFat >= 0 ? boot->ValidFat :0,
+		if (!_readfat_mtk(fs, boot, boot->ValidFat >= 0 ? boot->ValidFat :0,
 					 &old_fat)) {
 			free(buffer);
+			return FSFATAL;
+		}
+		
+		/* _readfat_mtk only read out 4K bytes */
+		if (count > MTK_READFAT_SIZE) {
+			perror("_readfat_mtk exceeds 4KB \n");
+			free(buffer);
+			free(old_fat);
 			return FSFATAL;
 		}
 
@@ -610,7 +806,7 @@ writefat(int fs, struct bootblock *boot, struct fatEntry *fat, int correct_fat)
 		free(old_fat);
 		p += count;
 	}
-			
+
 	for (cl = CLUST_FIRST; cl < boot->NumClusters; cl++) {
 		switch (boot->ClustMask) {
 		case CLUST32_MASK:
@@ -645,7 +841,7 @@ writefat(int fs, struct bootblock *boot, struct fatEntry *fat, int correct_fat)
 		off = boot->ResSectors + i * boot->FATsecs;
 		off *= boot->BytesPerSec;
 		if (lseek(fs, off, SEEK_SET) != off
-		    || write(fs, buffer, fatsz) != fatsz) {
+		    || write(fs, buffer, (int)fatsz) != (int)fatsz) {
 			perror("Unable to write FAT");
 			ret = FSFATAL; /* Return immediately?		XXX */
 		}
@@ -663,6 +859,8 @@ checklost(int dosfs, struct bootblock *boot, struct fatEntry *fat)
 	cl_t head;
 	int mod = FSOK;
 	int ret;
+
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "checklost()") ;
 	
 	for (head = CLUST_FIRST; head < boot->NumClusters; head++) {
 		/* find next untravelled chain */
@@ -685,12 +883,15 @@ checklost(int dosfs, struct bootblock *boot, struct fatEntry *fat)
 			continue;
 		}
 		if (ret == FSERROR && ask(1, "Clear")) {
+			pwarn("Error in reconnect - clearing\n");
+			mod &= ~FSERROR;
 			clearchain(boot, fat, head);
 			mod |= FSFATMOD;
 		}
 	}
 	finishlf();
 
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - check boot->FSInfo") ;
 	if (boot->FSInfo) {
 		ret = 0;
 		if (boot->FSFree != boot->NumFree) {
@@ -716,11 +917,12 @@ checklost(int dosfs, struct bootblock *boot, struct fatEntry *fat)
 			}
         }
 
+
 		if (boot->FSNext > boot->NumClusters  ) {
 			pwarn("FSNext block (%d) not correct NumClusters (%d)\n",
 					boot->FSNext, boot->NumClusters);
 			boot->FSNext=CLUST_FIRST; // boot->FSNext can have -1 value.
-	    }
+		}
 
 		if (boot->NumFree && fat[boot->FSNext].next != CLUST_FREE) {
 			pwarn("Next free cluster in FSInfo block (%u) not free\n",
@@ -732,8 +934,7 @@ checklost(int dosfs, struct bootblock *boot, struct fatEntry *fat)
 						ret = 1;
 						break;
 					}
-	    }
-
+		}
 		if (ret)
 			mod |= writefsinfo(dosfs, boot);
 	}

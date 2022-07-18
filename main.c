@@ -54,6 +54,7 @@ int alwaysyes;		/* assume "yes" for all questions */
 int preen;		/* set when preening */
 int rdonly;		/* device is opened read only (supersedes above) */
 int skipclean;		/* skip clean file systems if preening */
+int debugmessage;	/* print verbose message for debugging */
 
 static void usage(void);
 
@@ -74,11 +75,15 @@ main(int argc, char **argv)
 	int ch;
 
 	skipclean = 1;
-	while ((ch = getopt(argc, argv, "CfFnpy")) != -1) {
+	debugmessage = 0;
+	printf("The fsck_msdos options input by caller :\n") ;
+	while ((ch = getopt(argc, argv, "CfFnpyd")) != -1) {
 		switch (ch) {
 		case 'C': /* for fsck_ffs compatibility */
+			printf(" -C\n") ;
 			break;
 		case 'f':
+			printf(" -f\n") ;
 			skipclean = 0;
 			break;
 		case 'F':
@@ -90,19 +95,27 @@ main(int argc, char **argv)
 			 * in case someone tries -F directly.  The -F flag
 			 * is intentionally left out of the usage message.
 			 */
+			printf(" -F\n") ; 
 			exit(5);
 		case 'n':
 			alwaysno = 1;
 			alwaysyes = preen = 0;
+			printf(" -n\n") ;
 			break;
 		case 'y':
 			alwaysyes = 1;
 			alwaysno = preen = 0;
+			printf(" -y\n") ;
 			break;
 
 		case 'p':
 			preen = 1;
 			alwaysyes = alwaysno = 0;
+			printf(" -p\n") ;
+			break;
+		case 'd':
+			debugmessage = 1;
+			printf(" -d\n") ;
 			break;
 
 		default:
@@ -116,12 +129,21 @@ main(int argc, char **argv)
 	if (!argc)
 		usage();
 
+	start_count(&fsck_total_time) ;
 	while (--argc >= 0) {
 //		setcdevname(*argv, preen);
 		erg = checkfilesys(*argv++);
 		if (erg > ret)
 			ret = erg;
 	}
+	end_count("Total fsck time", &fsck_total_time) ;
+
+	printf("\n=== FSCK Time Usage ===\n") ;
+	printf("Phase#1 tooks %lu usecs.\n", print_time(&fsck_p1_time)) ;
+	printf("Phase#2 tooks %lu usecs.\n", print_time(&fsck_p2_time)) ;
+	printf("Phase#3 tooks %lu usecs.\n", print_time(&fsck_p3_time)) ;
+	printf("Phase#4 tooks %lu usecs.\n", print_time(&fsck_p4_time)) ;
+	printf("Total fsck tooks %lu usecs.\n", print_time(&fsck_total_time)) ;
 
 	return ret;
 }
@@ -136,6 +158,15 @@ ask(int def, const char *fmt, ...)
 	char prompt[256];
 	int c;
 
+	{
+		va_list ap_tmp ;
+		char prompt_tmp[256] ;
+		va_start(ap_tmp, fmt);
+		vsnprintf(prompt_tmp, sizeof(prompt_tmp), fmt, ap_tmp);
+		va_end(ap_tmp);
+		printf("ask if %s? ... ", prompt_tmp) ;
+	}
+
 	if (preen) {
 		if (rdonly)
 			def = 0;
@@ -146,6 +177,7 @@ ask(int def, const char *fmt, ...)
 
 	va_start(ap, fmt);
 	vsnprintf(prompt, sizeof(prompt), fmt, ap);
+	va_end(ap);
 	if (alwaysyes || rdonly) {
 		printf("%s? %s\n", prompt, rdonly ? "no" : "yes");
 		return !rdonly;
@@ -158,5 +190,5 @@ ask(int def, const char *fmt, ...)
 			if (feof(stdin))
 				return 0;
 	} while (c != 'y' && c != 'Y' && c != 'n' && c != 'N');
-	return c == 'y' || c == 'Y';
+	return (c == 'y' || c == 'Y');
 }

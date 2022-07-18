@@ -227,6 +227,8 @@ resetDosDirSection(struct bootblock *boot, struct fatEntry *fat)
 	cl_t cl;
 	int ret = FSOK;
 
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "resetDosDirSection()") ;
+
 	b1 = boot->RootDirEnts * 32;
 	b2 = boot->SecPerClust * boot->BytesPerSec;
 
@@ -238,6 +240,7 @@ resetDosDirSection(struct bootblock *boot, struct fatEntry *fat)
 	}
 	memset(rootDir, 0, sizeof *rootDir);
 	if (boot->flags & FAT32) {
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "resetDosDirSection() .. this is FAT32!");
 		if (boot->RootCl < CLUST_FIRST || boot->RootCl >= boot->NumClusters) {
 			pfatal("Root directory starts with cluster out of range(%u)",
 			       boot->RootCl);
@@ -257,10 +260,12 @@ resetDosDirSection(struct bootblock *boot, struct fatEntry *fat)
 				return FSFATAL;
 			}
 			if (ask(1, "Fix")) {
-				fat[boot->RootCl].next = CLUST_FREE;
+				fat[boot->RootCl].next = CLUST_EOF;
 				ret = FSFATMOD;
-			} else
+			} else {
 				ret = FSFATAL;
+				printf("%s() line#%d : FSFATAL no fix!\n", __func__, __LINE__) ;
+			}
 		}
 
 		fat[boot->RootCl].flags |= FAT_USED;
@@ -308,8 +313,13 @@ delete(int f, struct bootblock *boot, struct fatEntry *fat, cl_t startcl,
     int startoff, cl_t endcl, int endoff, int notlast)
 {
 	u_char *s, *e;
-	loff_t off;
+	off64_t off;
 	int clsz = boot->SecPerClust * boot->BytesPerSec;
+
+	if (debugmessage) {
+		printf(" delete : startcl=%u, startoff=%u, endcl=%u, endoff=%u \n", 
+			startcl, startoff, endcl, endoff);
+	}
 
 	s = delbuf + startoff;
 	e = delbuf + clsz;
@@ -372,14 +382,22 @@ removede(int f, struct bootblock *boot, struct fatEntry *fat, u_char *start,
 				   startcl, start - buffer,
 				   endcl, end - buffer,
 				   endcl == curcl) == FSFATAL)
+			{
+				printf("\n Fatal error in removede() \n");
 				return FSFATAL;
+			}
 			start = buffer;
 		}
-		if (endcl == curcl)
-			for (; start < end; start += 32)
+		/* startcl is < CLUST_FIRST for !fat32 root */
+		if ((endcl == curcl) || (startcl < CLUST_FIRST)){
+			for (; start < end; start += 32){
 				*start = SLOT_DELETED;
+			}
+		}
 		return FSDIRMOD;
 	}
+
+	printf("[ERR] Without any fix !\n") ;
 	return FSERROR;
 }
 
@@ -393,16 +411,28 @@ checksize(struct bootblock *boot, struct fatEntry *fat, u_char *p,
 	/*
 	 * Check size on ordinary files
 	 */
-	int32_t physicalSize;
+	u_int32_t physicalSize;
 
 	if (dir->head == CLUST_FREE)
 		physicalSize = 0;
 	else {
-		if (dir->head < CLUST_FIRST || dir->head >= boot->NumClusters)
+		if (dir->head < CLUST_FIRST || dir->head >= boot->NumClusters) {
+			pwarn("\n In checksize, ERROR : dir->head = %u \n", dir->head);
 			return FSERROR;
-		physicalSize = fat[dir->head].length * boot->ClusterSize;
+		}
+		if(boot->flags & FAT32){
+		  if(fat[dir->head].length > fat_entry_max_len)
+		    physicalSize = 0;
+      else if(fat[dir->head].length == fat_entry_max_len)
+        physicalSize = dir->size;
+      else
+		    physicalSize = fat[dir->head].length * boot->ClusterSize;
+		}
+		else
+		  physicalSize = fat[dir->head].length * boot->ClusterSize;
 	}
-	if (physicalSize < dir->size) {
+	//pwarn("file:%s, fat dir->head length:%d, clustersize:%d, physicalSize:%u\n", fullpath(dir), fat[dir->head].length, boot->ClusterSize, physicalSize);
+	if ((unsigned int)physicalSize < dir->size) {
 		pwarn("size of %s is %u, should at most be %u\n",
 		      fullpath(dir), dir->size, physicalSize);
 		if (ask(1, "Truncate")) {
@@ -451,6 +481,8 @@ check_dot_dot(int f, struct bootblock *boot, struct fatEntry *fat,struct dosDirE
 	int dot, dotdot;
 	dot = dotdot = 0;
 	cl = dir->head;
+
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "check_dot_dot().. Directory must have (.) and (..).");
 
 	if (dir->parent && (cl < CLUST_FIRST || cl >= boot->NumClusters)) {
 		return rc;
@@ -527,22 +559,32 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 {
 	struct dosDirEntry dirent, *d;
 	u_char *p, *vallfn, *invlfn, *empty;
-	loff_t off;
+	off64_t off;
 	int i, j, k, last;
 	cl_t cl, valcl = ~0, invcl = ~0, empcl = ~0;
 	char *t;
 	u_int lidx = 0;
 	int shortSum;
 	int mod = FSOK;
-	int n_count=0;
-	int rc=0;
+	//int n_count=0;
+	//int rc=0;
 #define	THISMOD	0x8000			/* Only used within this routine */
 
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "readDosDirSection()") ;
+
 	cl = dir->head;
+	
+	if (debugmessage) {
+		printf("\n-----------------------------------------------------------");
+		printf("\n readDosDirSection() : cl = %u ", cl);
+		printf("\n path = %s \n", fullpath(dir));
+	}
+
 	if (dir->parent && (cl < CLUST_FIRST || cl >= boot->NumClusters)) {
 		/*
 		 * Already handled somewhere else.
 		 */
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "readDosDirSection().. already handled somewhere else.");
 		return FSOK;
 	}
 	shortSum = -1;
@@ -552,6 +594,7 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 
 	do {
 		if (!(boot->flags & FAT32) && !dir->parent) {
+			xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Check non-FAT32 ROOT") ;
 			last = boot->RootDirEnts * 32;
 			off = boot->ResSectors + boot->FATs * boot->FATsecs;
 		} else {
@@ -579,8 +622,11 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 			if (*p == SLOT_EMPTY || *p == SLOT_DELETED) {
 				if (*p == SLOT_EMPTY) {
 					dir->fsckflags |= DIREMPTY;
-					empty = p;
-					empcl = cl;
+
+					if(empty == NULL){
+					    empty = p;
+					    empcl = cl;
+					}
 				}
 				continue;
 			}
@@ -595,11 +641,15 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 						dir->fsckflags &= ~DIREMPTY;
 						if (delete(f, boot, fat,
 							   empcl, empty - buffer,
-							   cl, p - buffer, 1) == FSFATAL)
+							   cl, p - buffer, 1) == FSFATAL) {
+							printf("%s() line#%d : FSFATAL\n", __func__, __LINE__) ;   
 							return FSFATAL;
+						}
 						q = empcl == cl ? empty : buffer;
-						for (; q < p; q += 32)
-							*q = SLOT_DELETED;
+						for (; q < p; q += 32){
+						    if(*q == SLOT_EMPTY)
+					                *q = SLOT_DELETED;
+						}
 						mod |= THISMOD|FSDIRMOD;
 					} else if (ask(1, "Truncate"))
 						dir->fsckflags |= DIREMPWARN;
@@ -608,12 +658,14 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 					*p = SLOT_DELETED;
 					mod |= THISMOD|FSDIRMOD;
 					continue;
-				} else if (dir->fsckflags & DIREMPTY)
+				} else if (dir->fsckflags & DIREMPTY) {
+					printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 					mod |= FSERROR;
+				}
 				empty = NULL;
 			}
 
-			if (p[11] == ATTR_WIN95) {
+			if (p[11] == ATTR_WIN95) {				
 				if (*p & LRFIRST) {
 					if (shortSum != -1) {
 						if (!invlfn) {
@@ -638,6 +690,16 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 					vallfn = NULL;
 				}
 				lidx = *p & LRNOMASK;
+				// check for error of lidx
+				if (lidx == 0) {
+				    printf("\n long directory entry ¡§LDIR_Ord¡¨ value = 0 ! \n");
+					if (!invlfn) {
+						invlfn = vallfn;
+						invcl = cl;
+					}
+					vallfn = NULL;
+					continue;
+				}
 				t = longName + --lidx * 13;
 				for (k = 1; k < 11 && t < longName + sizeof(longName); k += 2) {
 					if (!p[k] && !p[k + 1])
@@ -754,8 +816,10 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 						    invlfn, vallfn ? vallfn : p,
 						    invcl, vallfn ? valcl : cl, cl,
 						    fullpath(&dirent), 0);
-				if (mod & FSFATAL)
+				if (mod & FSFATAL) {
+					printf("%s() line#%d : FSFATAL\n", __func__, __LINE__) ;
 					return FSFATAL;
+				}
 				if (vallfn
 				    ? (valcl == cl && vallfn != buffer)
 				    : p != buffer)
@@ -777,8 +841,10 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 						clearchain(boot, fat, dirent.head);
 						dirent.head = 0;
 						mod |= THISMOD|FSDIRMOD|FSFATMOD;
-					} else
+					} else {
+						printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 						mod |= FSERROR;
+					}
 				}
 			} else if (dirent.head == 0
 				   && !strcmp(dirent.name, "..")
@@ -802,21 +868,23 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 					      fullpath(&dirent),
 					      dirent.head);
 				else if (fat[dirent.head].next == CLUST_FREE)
-					pwarn("%s starts with free cluster\n",
-					      fullpath(&dirent));
+					pwarn("%s starts with free cluster(%u)\n",
+					      fullpath(&dirent), dirent.head);
 				else if (fat[dirent.head].next >= CLUST_RSRVD)
 					pwarn("%s starts with cluster marked %s\n",
 					      fullpath(&dirent),
 					      rsrvdcltype(fat[dirent.head].next));
 				else
-					pwarn("%s doesn't start a cluster chain\n",
-					      fullpath(&dirent));
+					pwarn("%s doesn't start a cluster chain(%u)\n",
+					      fullpath(&dirent), dirent.head);
 				if (dirent.flags & ATTR_DIRECTORY) {
 					if (ask(1, "Remove")) {
 						*p = SLOT_DELETED;
 						mod |= THISMOD|FSDIRMOD;
-					} else
+					} else {
+						printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 						mod |= FSERROR;
+					}
 					continue;
 				} else {
 					if (ask(1, "Truncate")) {
@@ -826,18 +894,24 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 							p[20] = p[21] = 0;
 						dirent.size = 0;
 						mod |= THISMOD|FSDIRMOD;
-					} else
+					} else {
+						printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 						mod |= FSERROR;
+					}
 				}
 			}
 
-			if (dirent.head >= CLUST_FIRST && dirent.head < boot->NumClusters)
+			if (dirent.head >= CLUST_FIRST && dirent.head < boot->NumClusters) {
+				xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - chain start from cl#%x is used!", dirent.head) ;
 				fat[dirent.head].flags |= FAT_USED;
+			}
 
 			if (dirent.flags & ATTR_DIRECTORY) {
 				/*
 				 * gather more info for directories
 				 */
+				xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - gather more info for dir(%s)", fullpath(&dirent));
+				
 				struct dirTodoNode *n;
 
 				if (dirent.size) {
@@ -847,8 +921,10 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 						p[28] = p[29] = p[30] = p[31] = 0;
 						dirent.size = 0;
 						mod |= THISMOD|FSDIRMOD;
-					} else
+					} else {
+						printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 						mod |= FSERROR;
+					}
 				}
 				/*
 				 * handle '.' and '..' specially
@@ -866,8 +942,10 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 								p[21] = (u_char)(dirent.head >> 24);
 							}
 							mod |= THISMOD|FSDIRMOD;
-						} else
+						} else {
+							printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 							mod |= FSERROR;
+						}
 					}
 					continue;
                 } else if (strcmp(dirent.name, "..") == 0) {
@@ -882,8 +960,10 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 									if (boot->ClustMask == CLUST32_MASK)
 										p[20] = p[21] = 0;
 									mod |= THISMOD|FSDIRMOD;
-								} else
+								} else {
+									printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 									mod |= FSERROR;
+								}
 							}
 						} else if (dirent.head != dir->parent->head) {
 							pwarn("'..' entry in %s has incorrect start cluster\n",
@@ -897,23 +977,46 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 									p[21] = (u_char)(dirent.head >> 24);
 								}
 								mod |= THISMOD|FSDIRMOD;
-							} else
+							} else {
+								printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
 								mod |= FSERROR;
+							}
 						}
 					}
 					continue;
 				} else { //only one directory entry can point to dir->head, it's  '.'
-					if (dirent.head == dir->head) {
-						pwarn("%s entry in %s has incorrect start cluster.remove\n",
-								dirent.name, fullpath(dir));
-						//we have to remove this directory entry rigth now rigth here
-						if (ask(1, "Remove")) {
-							*p = SLOT_DELETED;
-							mod |= THISMOD|FSDIRMOD;
-						} else
-							mod |= FSERROR;
-						continue;
+				
+					/* check for infinite loop */
+					{
+						struct dosDirEntry *tmpDirEnt = dir;
+						int linkerror = 0;
+	
+						while (tmpDirEnt->parent)
+						{
+							if (dirent.head == tmpDirEnt->head) {
+								printf("\n Have the same cluster number ! (dirent.head = %d) \n", dirent.head);
+								linkerror = 1;
+								break;
+							}
+							tmpDirEnt = tmpDirEnt->parent;
+						}
+	 					if (linkerror) {
+							if (ask(1, "Remove")) {
+								*p = SLOT_DELETED;
+								p[28] = p[29] = p[30] = p[31] = 0;
+								p[26] = p[27] = 0;
+								if (boot->ClustMask == CLUST32_MASK)
+									p[20] = p[21] = 0;
+								dirent.size = 0;
+								mod |= THISMOD|FSDIRMOD;
+							} else {
+								printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
+								mod |= FSERROR;
+							}
+							continue;
+						}
 					}
+
 					/* Consistency checking. a directory must have at least two entries:
 					   a dot (.) entry that points to itself, and a dot-dot (..)
 					   entry that points to its parent.
@@ -923,8 +1026,10 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 						if (ask(1, "Remove")) {
 							*p = SLOT_DELETED;
 							mod |= THISMOD|FSDIRMOD;
-						} else
+						} else {
 							mod |= FSERROR;
+							printf("%s() line#%d : FSERROR\n", __func__, __LINE__) ;
+						}
 						continue;
                     }
 				}
@@ -956,6 +1061,10 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 			}
 			boot->NumFiles++;
 		}
+		
+		if (!(boot->flags & FAT32) && !dir->parent)
+			break;
+			
 		if (mod & THISMOD) {
 			last *= 32;
 			if (lseek64(f, off, SEEK_SET) != off
@@ -966,12 +1075,25 @@ readDosDirSection(int f, struct bootblock *boot, struct fatEntry *fat,
 			mod &= ~THISMOD;
 		}
 	} while ((cl = fat[cl].next) >= CLUST_FIRST && cl < boot->NumClusters);
-	if (invlfn || vallfn)
+	if (invlfn || vallfn){
 		mod |= removede(f, boot, fat,
 				invlfn ? invlfn : vallfn, p,
 				invlfn ? invcl : valcl, -1, 0,
 				fullpath(dir), 1);
-	return mod & ~THISMOD;
+	}
+	/* The root directory of non fat32 filesystems is in a special
+	 * area and may have been modified above without being written out.
+ 	*/
+	if ((mod & FSDIRMOD) && !(boot->flags & FAT32) && !dir->parent) {
+		last *= 32;
+		if (lseek(f, off, SEEK_SET) != off
+	    	|| write(f, buffer, last) != last) {
+			perror("Unable to write directory");
+			return FSFATAL;
+		}
+		mod &= ~THISMOD;
+	}
+	return (mod & ~THISMOD);
 }
 
 int
@@ -980,8 +1102,10 @@ handleDirTree(int dosfs, struct bootblock *boot, struct fatEntry *fat)
 	int mod;
 
 	mod = readDosDirSection(dosfs, boot, fat, rootDir);
-	if (mod & FSFATAL)
+	if (mod & FSFATAL) {
+		printf("%s() line#%d : FSFATAL from readDosDirSection()\n", __func__, __LINE__) ;
 		return FSFATAL;
+	}
 
 	/*
 	 * process the directory todo list
@@ -1001,8 +1125,11 @@ handleDirTree(int dosfs, struct bootblock *boot, struct fatEntry *fat)
 		 * handle subdirectory
 		 */
 		mod |= readDosDirSection(dosfs, boot, fat, dir);
-		if (mod & FSFATAL)
+		mod |= checkFsckExecutionTime();
+		if (mod & FSFATAL) {
+			printf("%s() line#%d : FSFATAL from readDosDirSection()\n", __func__, __LINE__) ;
 			return FSFATAL;
+		}
 	}
 
 	return mod;
@@ -1013,7 +1140,7 @@ handleDirTree(int dosfs, struct bootblock *boot, struct fatEntry *fat)
  */
 static u_char *lfbuf;
 static cl_t lfcl;
-static loff_t lfoff;
+static off64_t lfoff;
 
 int
 reconnect(int dosfs, struct bootblock *boot, struct fatEntry *fat, cl_t head)
@@ -1021,8 +1148,10 @@ reconnect(int dosfs, struct bootblock *boot, struct fatEntry *fat, cl_t head)
 	struct dosDirEntry d;
 	u_char *p;
 
-	if (!ask(1, "Reconnect"))
+	if (!ask(1, "Reconnect")) {
+		printf("%s() line#%d : FSERROR, do not want to reconnect\n", __func__, __LINE__) ;
 		return FSERROR;
+	}
 
 	if (!lostDir) {
 		for (lostDir = rootDir->child; lostDir; lostDir = lostDir->next) {
@@ -1061,7 +1190,7 @@ reconnect(int dosfs, struct bootblock *boot, struct fatEntry *fat, cl_t head)
 		lfoff = lfcl * boot->ClusterSize
 		    + boot->ClusterOffset * boot->BytesPerSec;
 		if (lseek64(dosfs, lfoff, SEEK_SET) != lfoff
-		    || read(dosfs, lfbuf, boot->ClusterSize) != boot->ClusterSize) {
+		    || read(dosfs, lfbuf, boot->ClusterSize) != (int)(boot->ClusterSize)) {
 			perror("could not read LOST.DIR");
 			return FSFATAL;
 		}
@@ -1069,12 +1198,14 @@ reconnect(int dosfs, struct bootblock *boot, struct fatEntry *fat, cl_t head)
 	}
 
 	boot->NumFiles++;
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "reconnect().. one more file(boot->NumFiles = %d)(put in LOST).", boot->NumFiles);
 	/* Ensure uniqueness of entry here!				XXX */
 	memset(&d, 0, sizeof d);
 	(void)snprintf(d.name, sizeof(d.name), "%u", head);
 	d.flags = 0;
 	d.head = head;
 	d.size = fat[head].length * boot->ClusterSize;
+	printf("LOST file name : %s, head : %x, size : %d clusters\n", d.name, d.head, d.size) ;
 
 	memset(p, 0, 32);
 	memset(p, ' ', 11);
@@ -1091,7 +1222,7 @@ reconnect(int dosfs, struct bootblock *boot, struct fatEntry *fat, cl_t head)
 	p[31] = (u_char)(d.size >> 24);
 	fat[head].flags |= FAT_USED;
 	if (lseek64(dosfs, lfoff, SEEK_SET) != lfoff
-	    || write(dosfs, lfbuf, boot->ClusterSize) != boot->ClusterSize) {
+	    || write(dosfs, lfbuf, boot->ClusterSize) != (int)(boot->ClusterSize)) {
 		perror("could not write LOST.DIR");
 		return FSFATAL;
 	}
@@ -1105,3 +1236,4 @@ finishlf(void)
 		free(lfbuf);
 	lfbuf = NULL;
 }
+

@@ -55,6 +55,27 @@ static const char rcsid[] =
  */
 #define FAT_COMPARE_MAX_KB 4096
 
+u_int32_t fat_entry_max_len;
+
+
+#include <sys/sysinfo.h>
+#define FAT_MAX_FSCK_OVERALL_TIME 120
+static struct sysinfo fsck_msdos_sysinfo;
+static long checkfilesys_start_uptime = 0;
+
+int
+checkFsckExecutionTime()
+{
+    int ret = FSOK;
+
+    sysinfo(&fsck_msdos_sysinfo);
+    if (fsck_msdos_sysinfo.uptime - checkfilesys_start_uptime >= FAT_MAX_FSCK_OVERALL_TIME) {
+        printf("%s: Fatal error: the total fsck time is already greater than %ld seconds \n", __FUNCTION__, FAT_MAX_FSCK_OVERALL_TIME);
+        ret |= FSFATAL;
+    }
+    return ret;
+}
+
 int
 checkfilesys(const char *fname)
 {
@@ -64,8 +85,10 @@ checkfilesys(const char *fname)
 	int i, finish_dosdirsection=0;
 	int mod = 0;
 	int ret = 8;
-        int quiet = 0;
-        int skip_fat_compare = 0;
+	int quiet = 0;
+	int skip_fat_compare = 0;
+	int bootret;
+	xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "checkfilesys start");
 
 	rdonly = alwaysno;
 	if (!quiet)
@@ -73,6 +96,7 @@ checkfilesys(const char *fname)
 
 	dosfs = open(fname, rdonly ? O_RDONLY : O_RDWR, 0);
 	if (dosfs < 0 && !rdonly) {
+		xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, "dosfs < 0 && !rdonly");
 		dosfs = open(fname, O_RDONLY, 0);
 		if (dosfs >= 0)
 			pwarn(" (NO WRITE)\n");
@@ -84,15 +108,26 @@ checkfilesys(const char *fname)
 
 	if (dosfs < 0) {
 		perror("Can't open");
+		printf("%s() : Cannot open %s\n", __func__, fname) ;
 		return 8;
 	}
 
-	if (readboot(dosfs, &boot) == FSFATAL) {
+	bootret = readboot(dosfs, &boot);
+	if (bootret == FSFATAL) {
 		close(dosfs);
 		printf("\n");
 		return 8;
 	}
+	else if (bootret == FSOTHERFORMAT) {
+		close(dosfs);
+		printf("\n");
+		return 16;
+	}
 
+	fat_entry_max_len = MTK_VFAT_MAX_FILE_SIZE/boot.ClusterSize;
+	fat_entry_max_len++;
+	printf("MTK_VFAT_MAX_FILE_SIZE:%lu, fat_entry_max_len:%u, bytes per cluster:%u\n", MTK_VFAT_MAX_FILE_SIZE, fat_entry_max_len, boot.ClusterSize);
+  
 	if (skipclean && preen && checkdirty(dosfs, &boot)) {
 		printf("%s: ", fname);
 		printf("FILESYSTEM CLEAN; SKIPPING CHECKS\n");
@@ -100,9 +135,19 @@ checkfilesys(const char *fname)
 		goto out;
 	}
 
-        if (((boot.FATsecs * boot.BytesPerSec) / 1024) > FAT_COMPARE_MAX_KB)
+        if (((boot.FATsecs * boot.BytesPerSec) / 1024) > FAT_COMPARE_MAX_KB) {
+			xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - ((boot.FATsecs * boot.BytesPerSec) / 1024) = %d > FAT_COMPARE_MAX_KB(%d)", 
+				((boot.FATsecs * boot.BytesPerSec) / 1024), 
+				FAT_COMPARE_MAX_KB
+			);		
+			xlog_printf(ANDROID_LOG_INFO, FSCK_XLOG_TAG, " - Skip FAT compare!") ;
             skip_fat_compare = 1;
+        }
 
+	sysinfo(&fsck_msdos_sysinfo);
+	checkfilesys_start_uptime = fsck_msdos_sysinfo.uptime;
+
+	start_count(&fsck_p1_time) ;
 	if (!quiet)  {
                 if (skip_fat_compare) 
                         printf("** Phase 1 - Read FAT (compare skipped)\n");
@@ -113,8 +158,11 @@ checkfilesys(const char *fname)
 	}
 
 	mod |= readfat(dosfs, &boot, boot.ValidFat >= 0 ? boot.ValidFat : 0, &fat);
+	if (mod & FSERROR) {
+		printf("FSERROR after readfat()\n");
+	}
 	if (mod & FSFATAL) {
-		printf("Fatal error during readfat()\n");
+		printf("\nFatal error during readfat()\n");
 		close(dosfs);
 		return 8;
 	}
@@ -132,27 +180,41 @@ checkfilesys(const char *fname)
 
 			mod |= comparefat(&boot, fat, currentFat, i);
 			free(currentFat);
+
+			mod |= checkFsckExecutionTime();
 			if (mod & FSFATAL) {
 				printf("Fatal error during FAT comparison\n");
-				goto out;
+				free(fat);
+				(void)close(dosfs);
+				return 8;
 			}
 		}
+	end_count("Phase#1", &fsck_p1_time) ;
 
+	start_count(&fsck_p2_time) ;
 	if (!quiet)
 		printf("** Phase 2 - Check Cluster Chains\n");
 
 	mod |= checkfat(&boot, fat);
+	if (mod & FSERROR) {
+		printf("FSERROR after checkfat()\n");
+	}
 	if (mod & FSFATAL) {
 		printf("Fatal error during FAT check\n");
 		goto out;
 	}
+	end_count("Phase#2", &fsck_p2_time) ;
+	
 	/* delay writing FATs */
-
+	start_count(&fsck_p3_time) ;
 	if (!quiet)
 		printf("** Phase 3 - Checking Directories\n");
 
 	mod |= resetDosDirSection(&boot, fat);
 	finish_dosdirsection = 1;
+	if (mod & FSERROR) {
+		printf("FSERROR after resetDosDirSection()\n");
+	}
 	if (mod & FSFATAL) {
 		printf("Fatal error during resetDosDirSection()\n");
 		goto out;
@@ -160,15 +222,31 @@ checkfilesys(const char *fname)
 	/* delay writing FATs */
 
 	mod |= handleDirTree(dosfs, &boot, fat);
-	if (mod & FSFATAL)
+	if (mod & FSERROR) {
+		printf("FSERROR after handleDirTree()\n");
+		/* try to recovery again */
+		mod &= ~FSERROR;
+		mod |= handleDirTree(dosfs, &boot, fat);
+	}
+	if (mod & FSFATAL) {
+		printf("Fatal error during handleDirTree()\n");
 		goto out;
+	}
+	end_count("Phase#3", &fsck_p3_time) ;
 
+	start_count(&fsck_p4_time) ;
 	if (!quiet)
 		printf("** Phase 4 - Checking for Lost Files\n");
 
 	mod |= checklost(dosfs, &boot, fat);
-	if (mod & FSFATAL)
+	if (mod & FSERROR) {
+		printf("FSERROR after checklost()\n");
+	}
+	if (mod & FSFATAL) {
+		printf("Fatal error during checklost()\n");
 		goto out;
+	}
+	end_count("Phase#4", &fsck_p4_time) ;
 
 	/* now write the FATs */
 	if (mod & FSFATMOD) {
@@ -218,6 +296,14 @@ checkfilesys(const char *fname)
 	free(fat);
 	close(dosfs);
 
+	if (mod & FSFATAL) {
+		pwarn("\n***** FSFATAL *****\n");
+		return 8;
+	}
+	if (mod & FSERROR) {
+		pwarn("\n***** FSERROR *****\n");
+		return 8;
+	}
 	if (mod & (FSFATMOD|FSDIRMOD)) {
 		pwarn("\n***** FILE SYSTEM WAS MODIFIED *****\n");
 		return 4; 
